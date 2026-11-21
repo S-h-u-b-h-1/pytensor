@@ -1193,6 +1193,53 @@ def test_scalar_pullback():
     assert dout_dxtm1.eval({xtm1: 3.0, dout_dxt: 1.5}) == 2 * 3.0 * 1.5
 
 
+@pytest.mark.parametrize(
+    "outputs, expected",
+    [
+        (lambda x, y: [y, y], 40.0),
+        (lambda x, y: [x, 2 * x], 8.0),
+        (lambda x, y: [y, 3 * y], 88.0),
+    ],
+    ids=["repeated_output", "input_as_output", "intermediate_as_output"],
+)
+def test_pullback_with_overlapping_outputs(outputs, expected):
+    x = dscalar("x")
+    g1, g2 = dscalar("g1"), dscalar("g2")
+
+    result = pullback(outputs(x, x**2), x, [g1, g2])
+
+    assert result.eval({x: 4.0, g1: 2.0, g2: 3.0}, on_unused_input="ignore") == expected
+
+
+def test_pullback_repeated_integer_output():
+    x = iscalar("x")
+    g1, g2 = dscalar("g1"), dscalar("g2")
+
+    utt.assert_equal_computations([pullback([x, x], x, [g1, g2])], [g1 + g2])
+
+
+def test_pullback_with_disconnected_cotangent():
+    x, g = dscalar("x"), dscalar("g")
+
+    result = pullback([x, x], x, [g, DisconnectedType()()])
+
+    utt.assert_equal_computations([result], [g])
+
+
+def test_pullback_with_undefined_cotangent():
+    x, g = dscalar("x"), dscalar("g")
+
+    with pytest.raises(NullTypeGradError):
+        pullback([x, x], x, [NullType()(), g])
+
+
+def test_known_grads_override_downstream_contributions():
+    x = dscalar("x")
+    g1, g2 = dscalar("g1"), dscalar("g2")
+
+    assert grad(None, x, known_grads={x: g1, x**2: g2}) is g1
+
+
 def test_disconnected_type_filter_variable_raises():
     # Regression: the override was misspelled (fiter_variable), so the base
     # Type.filter_variable was used and assignment silently went unguarded.

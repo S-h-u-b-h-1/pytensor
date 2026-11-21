@@ -4,6 +4,7 @@ import time
 import warnings
 from collections.abc import Callable, Mapping, MutableSequence, Sequence
 from functools import partial, reduce
+from itertools import chain
 from typing import TYPE_CHECKING, Literal, TypeVar, Union, overload
 
 import numpy as np
@@ -470,7 +471,8 @@ def pullback(
     wrt
         Variables for which the pull-back of `f` is computed.
     cotangents
-        Cotangent vectors, one for each output in `f`.
+        Cotangent vectors, one for each output position in `f`. Every
+        cotangent contributes, including when an output occurs more than once.
     consider_constant
         See `grad`.
     disconnected_inputs
@@ -481,7 +483,7 @@ def pullback(
     :class:`~pytensor.graph.basic.Variable` or list/tuple of Variables
         A symbolic expression for the vector-Jacobian product
         ``vJp[j] = sum_i cotangents[i] (d f[i] / d wrt[j])``.
-        If `f` is a list/tuple, then return a list/tuple with the results.
+        If `wrt` is a list or tuple, return the results in the same container type.
     """
     from pytensor.tensor import as_tensor_variable
 
@@ -495,24 +497,24 @@ def pullback(
         f = [f]
     _f = [x if isinstance(x, Variable) else as_tensor_variable(x) for x in f]
 
-    grads = list(_cotangents)
-
     using_list = isinstance(wrt, list)
     using_tuple = isinstance(wrt, tuple)
     if not isinstance(wrt, Sequence):
         wrt = [wrt]
     _wrt = [x if isinstance(x, Variable) else as_tensor_variable(x) for x in wrt]
 
-    assert len(_f) == len(grads)
-    known = dict(zip(_f, grads, strict=True))
+    assert len(_f) == len(_cotangents)
+    output_cotangents: dict[Variable, list[Variable]] = {}
+    for output, cotangent in zip(_f, _cotangents, strict=True):
+        output_cotangents.setdefault(output, []).append(cotangent)
 
-    ret = grad(
+    ret = _grad(
         cost=None,
-        known_grads=known,
         consider_constant=consider_constant,
         wrt=_wrt,
         disconnected_inputs=disconnected_inputs,
         return_disconnected=return_disconnected,
+        output_cotangents=output_cotangents,
     )
 
     return as_list_or_tuple(using_list, using_tuple, ret)
@@ -652,11 +654,37 @@ def grad(
         of the `wrt` terms.  If an element of `wrt` is not differentiable with
         respect to the output, then a zero variable is returned.
     """
+    return _grad(
+        cost,
+        wrt,
+        consider_constant=consider_constant,
+        disconnected_inputs=disconnected_inputs,
+        add_names=add_names,
+        known_grads=known_grads,
+        return_disconnected=return_disconnected,
+        null_gradients=null_gradients,
+    )
+
+
+def _grad(
+    cost: Variable | None,
+    wrt: Variable | Sequence[Variable],
+    consider_constant: Sequence[Variable] | None = None,
+    disconnected_inputs: Literal["ignore", "warn", "raise"] = "raise",
+    add_names: bool = True,
+    known_grads: Mapping[Variable, Variable] | None = None,
+    return_disconnected: Literal["none", "zero", "disconnected"] = "zero",
+    null_gradients: Literal["raise", "return"] = "raise",
+    *,
+    output_cotangents: Mapping[Variable, Sequence[Variable]] | None = None,
+) -> Variable | Sequence[Variable | None] | None:
     t0 = time.perf_counter()
 
-    if cost is None:
-        if known_grads is None:
-            raise ValueError("cost and known_grads can't both be None.")
+    if cost is None and known_grads is None and output_cotangents is None:
+        raise ValueError("cost and known_grads can't both be None.")
+
+    if output_cotangents is None:
+        output_cotangents = {}
 
     if cost is not None and isinstance(cost.type, NullType):
         raise ValueError(
@@ -676,6 +704,7 @@ def grad(
         outputs.append(cost)
     if known_grads is not None:
         outputs.extend(list(known_grads))
+    outputs.extend(output_cotangents)
 
     var_to_app_to_idx = _populate_var_to_app_to_idx(outputs, _wrt, consider_constant)
 
@@ -711,9 +740,9 @@ def grad(
 
         grad_dict[cost] = g_cost
 
-    for var in known_grads:
-        g_var = known_grads[var]
-
+    for g_var in chain(
+        known_grads.values(), chain.from_iterable(output_cotangents.values())
+    ):
         if not hasattr(g_var, "type"):
             raise TypeError(
                 "output grads must be pytensor variables."
@@ -730,12 +759,9 @@ def grad(
                 "given a known_grad of type " + str(g_var.type)
             )
 
-        # DO NOT check that these gradients are equal to 0 if var is int
-        # The gradient is allowed to be non-zero on var in that case
-        # Ops outputting var should not backpropagate its gradient further
-        # but that is enforced elsewhere (grep for only_connected_to_int)
-
-        grad_dict[var] = g_var
+    # A seed at an integer variable may be nonzero. The Op contract governs
+    # whether that gradient can pass to the variable's inputs.
+    grad_dict.update(known_grads)
 
     def handle_disconnected(var):
         if disconnected_inputs == "ignore":
@@ -763,7 +789,11 @@ def grad(
     # so that wrt not being in var_to_app_to_idx won't cause an error below
     # according to the flag, possibly raise an error if wrt is disconnected
     for elem in _wrt:
-        if elem not in var_to_app_to_idx and elem is not cost and elem not in grad_dict:
+        if (
+            elem not in var_to_app_to_idx
+            and elem not in grad_dict
+            and elem not in output_cotangents
+        ):
             handle_disconnected(elem)
             grad_dict[elem] = disconnected_type()
 
@@ -771,16 +801,19 @@ def grad(
     if add_names and cost is not None:
         cost_name = cost.name
 
-    # Make sure we didn't initialize the grad_dict with any ints
+    # Make sure we didn't initialize any gradient seeds with ints.
     # The gradient may NEVER be an int, even if the variable is an int.
     # Read the Op contract and talk to Ian Goodfellow before changing this!
-    for var in grad_dict:
-        g = grad_dict[var]
+    for g in chain(grad_dict.values(), chain.from_iterable(output_cotangents.values())):
         if hasattr(g.type, "dtype"):
             assert g.type.dtype in pytensor.tensor.type.float_dtypes
 
     _rval: Sequence[Variable] = _populate_grad_dict(
-        var_to_app_to_idx, grad_dict, _wrt, cost_name
+        var_to_app_to_idx,
+        grad_dict,
+        _wrt,
+        cost_name,
+        output_cotangents=output_cotangents,
     )
 
     rval: MutableSequence[Variable | None] = list(_rval)
@@ -1162,7 +1195,9 @@ class DisconnectedInputError(ValueError):
     """
 
 
-def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
+def _populate_grad_dict(
+    var_to_app_to_idx, grad_dict, wrt, cost_name=None, *, output_cotangents
+):
     """Helper function for grad function.
 
     Parameters
@@ -1187,6 +1222,8 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
     cost_name: string
         The name of the cost being differentiated, optional.
         Used to name the grad with respect to x as (d<cost_name>/dx)
+    output_cotangents : mapping
+        Terms to add to each output's gradient alongside downstream contributions.
 
     Returns
     -------
@@ -1473,12 +1510,19 @@ def _populate_grad_dict(var_to_app_to_idx, grad_dict, wrt, cost_name=None):
     def access_grad_cache(var):
         if var not in grad_dict:
             # If var is not in grad_dict already, we must compute it
-            if var in var_to_app_to_idx:
+            cotangents = output_cotangents.get(var, ())
+            node_to_idx = var_to_app_to_idx.get(var)
+            if node_to_idx is not None or cotangents:
                 null_terms = []
                 terms = []
-                node_to_idx = var_to_app_to_idx[var]
-                for node in node_to_idx:
-                    for idx in node_to_idx[node]:
+                for cotangent in cotangents:
+                    if isinstance(cotangent.type, NullType):
+                        null_terms.append(cotangent)
+                    elif not isinstance(cotangent.type, DisconnectedType):
+                        terms.append(cotangent)
+
+                for node, indices in (node_to_idx or {}).items():
+                    for idx in indices:
                         term = access_term_cache(node)[idx]
 
                         if not isinstance(term, Variable):

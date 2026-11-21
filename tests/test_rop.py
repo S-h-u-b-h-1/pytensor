@@ -473,3 +473,18 @@ class TestPushforwardPullback(PushforwardPullbackChecker):
                 use_op_pushforward=use_op_pushforward,
                 disconnected_outputs="raise",
             )
+
+
+@pytest.mark.parametrize(
+    "operation, expected",
+    [(pt.add, 5.0), (pt.sub, -1.0), (lambda a, b: a + 2 * b, 8.0)],
+    ids=["add", "sub", "weighted_add"],
+)
+def test_pushforward_with_two_tangents(operation, expected):
+    a, b = pt.dscalars("a", "b")
+    a_dot, b_dot = pt.dscalars("a_dot", "b_dot")
+
+    result = pushforward(operation(a, b), [a, b], [a_dot, b_dot])
+    evaluate = function([a, b, a_dot, b_dot], result, on_unused_input="ignore")
+
+    assert evaluate(7.0, 11.0, 2.0, 3.0) == expected
